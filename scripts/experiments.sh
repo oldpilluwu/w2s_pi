@@ -40,7 +40,8 @@ export GPUS_PER_NODE=${GPUS_PER_NODE:-2}                 # 2x A100 80GB pod
 export MINI_BATCH_SIZE=${MINI_BATCH_SIZE:-64}            # prompts per step (paper: 64), x N_RESPONSES rollouts
 export N_RESPONSES=${N_RESPONSES:-4}
 export TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-120}
-export SAVE_FREQ=${SAVE_FREQ:-120}                       # one checkpoint at the end (~50-60 GB)
+export SAVE_FREQ=${SAVE_FREQ:-120}                       # one checkpoint at the end
+export CKPT_CONTENTS=${CKPT_CONTENTS:-full}              # full (resumable) | weights (eval only, ~1/3 the size)
 export TEST_FREQ=${TEST_FREQ:-30}                        # eval at steps 30, 60, 90, 120
 export VAL_N=${VAL_N:-16}                                # mean@16
 export TEST_DATASET=${TEST_DATASET:-"['${REPO_ROOT}/datasets/eval/aime25.parquet']"}   # AIME25 only
@@ -98,6 +99,7 @@ preset() {
       # reward settings only decide which workers get built; nothing is trained
       export REWARD_MODE=prob_delta TARGET_FORM=direct_pi PI_GATE=all LOSS_FORM=pg
       export VAL_ONLY=True VAL_BEFORE_TRAIN=True
+      export LOAD_CONTENTS="['model']"   # works for both full and weights-only checkpoints
       if [ "$CKPT" = "base" ]; then
         export RESUME_MODE=disable
         export EXPERIMENT_NAME=${EXPERIMENT_NAME:-eval_base}
@@ -120,7 +122,8 @@ preset "$NAME"
 echo "[experiments] ${EXPERIMENT_NAME}: REWARD_MODE=${REWARD_MODE} TARGET_FORM=${TARGET_FORM:-n/a} PI_GATE=${PI_GATE:-n/a}" \
      "SUPPORT_FROM=${SUPPORT_FROM:-default} LOSS_FORM=${LOSS_FORM:-n/a} GPUS=${GPUS_PER_NODE} BATCH=${MINI_BATCH_SIZE}" \
      "STEPS=${TOTAL_TRAINING_STEPS} TEST_FREQ=${TEST_FREQ} VAL_N=${VAL_N} SAVE_FREQ=${SAVE_FREQ} VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN}" \
-     "VAL_ONLY=${VAL_ONLY:-False} RESUME_MODE=${RESUME_MODE:-auto} RESUME_FROM_PATH=${RESUME_FROM_PATH:-none}"
+     "VAL_ONLY=${VAL_ONLY:-False} RESUME_MODE=${RESUME_MODE:-auto} RESUME_FROM_PATH=${RESUME_FROM_PATH:-none}" \
+     "CKPT_CONTENTS=${CKPT_CONTENTS} LOAD_CONTENTS=${LOAD_CONTENTS:-same}"
 if [ "${DRY_RUN:-0}" = "1" ]; then
   echo "[experiments] DRY_RUN=1: TEST_DATASET=${TEST_DATASET} TRAIN_DATASET=${TRAIN_DATASET:-default} PYTHON_BIN=${PYTHON_BIN}"
   exit 0

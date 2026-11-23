@@ -101,6 +101,21 @@ VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-True}
 VAL_ONLY=${VAL_ONLY:-False}
 RESUME_MODE=${RESUME_MODE:-auto}  # auto | disable | resume_path
 RESUME_FROM_PATH=${RESUME_FROM_PATH:-}
+# what each actor checkpoint holds:
+#   full    = weights + optimizer + scheduler/RNG (resumable; ~48 GB per checkpoint on 1 GPU for the 4B student)
+#   weights = weights only (enough for eval_ckpt; ~16 GB; a crashed run cannot resume from it)
+CKPT_CONTENTS=${CKPT_CONTENTS:-full}
+case "${CKPT_CONTENTS}" in
+  full) SAVE_CONTENTS="['model','optimizer','extra']" ;;
+  weights) SAVE_CONTENTS="['model']" ;;
+  *) echo "CKPT_CONTENTS must be 'full' or 'weights', got '${CKPT_CONTENTS}'" >&2; exit 1 ;;
+esac
+LOAD_CONTENTS=${LOAD_CONTENTS:-${SAVE_CONTENTS}}
+if [ "${CKPT_CONTENTS}" = "weights" ] && [ "${RESUME_MODE}" = "auto" ] && [ "${VAL_ONLY}" != "True" ]; then
+  # auto-resume from a weights-only checkpoint would silently restart Adam and the LR schedule
+  RESUME_MODE=disable
+  echo "[ckpt] CKPT_CONTENTS=weights: auto-resume disabled; rerunning starts from step 0" >&2
+fi
 LOG_VAL_GENERATIONS=${LOG_VAL_GENERATIONS:-2}
 VAL_N=${VAL_N:-16}
 SAVE_FREQ=${SAVE_FREQ:-20}
@@ -120,7 +135,9 @@ REF_LOG_PROB_MAX_TOKEN_LEN_PER_GPU=${REF_LOG_PROB_MAX_TOKEN_LEN_PER_GPU:-16384}
 ROLLOUT_MAX_NUM_BATCHED_TOKENS=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-${MAX_MODEL_LEN}}
 mkdir -p "${LOG_ROOT}" "${CHECKPOINT_DIR}" "${OUTPUTS_DIR}/validation_log"
 
-RESUME_ARGS=(trainer.resume_mode="${RESUME_MODE}" trainer.val_only="${VAL_ONLY}")
+RESUME_ARGS=(trainer.resume_mode="${RESUME_MODE}" trainer.val_only="${VAL_ONLY}"
+  actor_rollout_ref.actor.checkpoint.save_contents="${SAVE_CONTENTS}"
+  actor_rollout_ref.actor.checkpoint.load_contents="${LOAD_CONTENTS}")
 if [ -n "${RESUME_FROM_PATH}" ]; then
   RESUME_ARGS+=(trainer.resume_from_path="${RESUME_FROM_PATH}")
 fi
@@ -141,8 +158,26 @@ fi
 
 if [ "${MANAGE_RAY}" = "True" ]; then
   "${RAY_BIN}" stop --force || true
-  "${RAY_BIN}" start --head --disable-usage-stats
+  # Ray has no authentication: anyone who can reach its ports can run code on this machine.
+  # Single-node runs only need loopback, so bind everything Ray can bind to 127.0.0.1.
+  # A host firewall that blocks all inbound traffic except SSH is still required.
+  RAY_BIND_LOCAL=${RAY_BIND_LOCAL:-True}
+  RAY_START_ARGS=(--head --disable-usage-stats)
+  if [ "${RAY_BIND_LOCAL}" = "True" ]; then
+    RAY_START_ARGS+=(--node-ip-address=127.0.0.1 --dashboard-host=127.0.0.1)
+  fi
+  "${RAY_BIN}" start "${RAY_START_ARGS[@]}"
   sleep 5
+  # Warn about anything listening on a non-loopback address apart from SSH (22) and Jupyter (8888)
+  if command -v ss >/dev/null 2>&1; then
+    EXPOSED=$(ss -Htlnp 2>/dev/null | awk '{print $4, $6}' \
+      | grep -vE '^(127\.[0-9.]+|\[::1\]|\[::ffff:127\.[0-9.]+\]):[0-9]+ ' \
+      | grep -vE ':(22|8888) ' || true)
+    if [ -n "${EXPOSED}" ]; then
+      echo "WARNING: ports listening on non-loopback addresses (Ray has no auth; block them with a firewall):" >&2
+      echo "${EXPOSED}" >&2
+    fi
+  fi
 fi
 
 set +e
