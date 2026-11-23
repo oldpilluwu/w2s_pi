@@ -119,7 +119,22 @@ python scripts/eval_vllm.py --model checkpoints/p1_nopi_union/global_step_60 --n
 ```
 
 Results go to `logs/eval_vllm/<run>_s<step>.json` (mean@N, maj@N, best@N, truncation rate per
-benchmark) plus per-sample `.samples.jsonl`. On a multi-GPU eval machine, run one checkpoint per GPU
+benchmark) plus per-sample `.samples.jsonl`.
+
+To move checkpoints through a private Hugging Face repo automatically:
+
+```bash
+# training machine, next to training (token with write access to this one repo)
+python scripts/hf_ckpt_upload.py --repo <user>/w2s-ckpts --delete-local
+# eval machine (read token); one copy per GPU if you have several
+python scripts/hf_ckpt_eval.py --repo <user>/w2s-ckpts --delete-local
+```
+
+The uploader converts each finished checkpoint to bf16 (~8 GB), uploads it to
+`<run>/global_step_N/actor/huggingface` in one commit, checks every file arrived, and leaves a
+`.uploaded` marker. The evaluator downloads checkpoints it has no result for (earliest step first),
+runs `eval_vllm.py` (arguments after `--` are passed on) and marks failures with `<name>.failed`
+(delete it to retry). On a multi-GPU eval machine, run one checkpoint per GPU
 (`CUDA_VISIBLE_DEVICES=i ... &`). `CKPT_CONTENTS=hf` (and `weights`) checkpoints cannot resume a
 crashed run, so auto-resume is off for them.
 Results go to `logs/eval_<run>_s<step>.out` and to W&B as run `eval_<run>_s<step>`, logged at the
