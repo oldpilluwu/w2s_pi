@@ -10,7 +10,7 @@ conda activate direct-opd
 
 cd verl
 USE_MEGATRON=0 bash scripts/install_vllm_sglang_mcore.sh
-pip install math-verify pyarrow transformers
+pip install math-verify pyarrow "transformers>=4.56.0,<5"   # verl/vLLM 0.11 break on transformers 5
 cd ..
 ```
 
