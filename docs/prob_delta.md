@@ -70,9 +70,19 @@ Target / loss variants:
 
 ## Submitting
 
-All runs default to 120 training steps. Named presets live in `scripts/experiments.sh`
-(`bash scripts/experiments.sh --list`); priority 1 = `p1_direct_opd`, `p1_direct_pi_union`,
-`p1_nopi_union`; priority 2 = `p2_*`; priority 3 = `p3_*` (needs teacher pass rates).
+Named presets live in `scripts/experiments.sh` (`bash scripts/experiments.sh --list`). Every run
+setting is written out there (2 GPUs, 64 prompts x 4 rollouts, 120 steps, eval on AIME25 with
+n=16 every 30 steps, one checkpoint at the end); override any of them as `KEY=VALUE` arguments:
+
+```bash
+bash scripts/experiments.sh p1_direct_pi_union                      # first run (step-0 eval on)
+bash scripts/experiments.sh p1_direct_opd
+bash scripts/experiments.sh p1_nopi_union
+bash scripts/experiments.sh p1_direct_pi_union TOTAL_TRAINING_STEPS=2  # smoke run
+DRY_RUN=1 bash scripts/experiments.sh p1_direct_opd                 # print settings only
+```
+
+Priority 1 = `p1_*`; priority 2 = `p2_*`; priority 3 = `p3_*` (needs teacher pass rates).
 
 ## Run order (original plan)
 
