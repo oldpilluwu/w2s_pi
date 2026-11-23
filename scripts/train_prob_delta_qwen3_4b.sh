@@ -78,6 +78,11 @@ ADAPTIVE_KL_LOSS_EPS=${ADAPTIVE_KL_LOSS_EPS:-0.01}
 ADAPTIVE_KL_LOSS_MIN_COEF=${ADAPTIVE_KL_LOSS_MIN_COEF:-0.5}
 ADAPTIVE_KL_LOSS_MAX_COEF=${ADAPTIVE_KL_LOSS_MAX_COEF:-2.5}
 MODEL_DTYPE=${MODEL_DTYPE:-fp32}
+# memory knobs for small nodes (e.g. 2x A100 80GB): offload the student's Adam states to CPU,
+# store teacher weights in bf16 (their forward already runs under bf16 autocast)
+ACTOR_PARAM_OFFLOAD=${ACTOR_PARAM_OFFLOAD:-False}
+ACTOR_OPTIMIZER_OFFLOAD=${ACTOR_OPTIMIZER_OFFLOAD:-False}
+TEACHER_DTYPE=${TEACHER_DTYPE:-${MODEL_DTYPE}}
 LOSS_AGG_MODE=${LOSS_AGG_MODE:-token-mean}
 PARALLEL_SIZE=${PARALLEL_SIZE:-1}
 OPTIM_LR=${OPTIM_LR:-1e-6}
@@ -163,8 +168,8 @@ set +e
   actor_rollout_ref.actor.adaptive_kl_loss_max_coef="${ADAPTIVE_KL_LOSS_MAX_COEF}" \
   actor_rollout_ref.actor.kl_loss_type=low_var_kl \
   actor_rollout_ref.actor.loss_agg_mode="${LOSS_AGG_MODE}" \
-  actor_rollout_ref.actor.fsdp_config.param_offload=False \
-  actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+  actor_rollout_ref.actor.fsdp_config.param_offload="${ACTOR_PARAM_OFFLOAD}" \
+  actor_rollout_ref.actor.fsdp_config.optimizer_offload="${ACTOR_OPTIMIZER_OFFLOAD}" \
   actor_rollout_ref.actor.fsdp_config.forward_prefetch=True \
   actor_rollout_ref.actor.fsdp_config.model_dtype="${MODEL_DTYPE}" \
   actor_rollout_ref.rollout.max_num_batched_tokens="${ROLLOUT_MAX_NUM_BATCHED_TOKENS}" \
@@ -214,14 +219,14 @@ set +e
   reward_model.model.input_tokenizer=null \
   reward_model.model.use_remove_padding=True \
   reward_model.model.fsdp_config.param_offload=False \
-  +reward_model.model.dtype="${MODEL_DTYPE}" \
+  +reward_model.model.dtype="${TEACHER_DTYPE}" \
   reward_model.micro_batch_size_per_gpu=24 \
   +teacher_ref_reward_model.enable=True \
   +teacher_ref_reward_model.model.path="${TEACHER_REF_MODEL_PATH}" \
   +teacher_ref_reward_model.model.input_tokenizer=null \
   +teacher_ref_reward_model.model.use_remove_padding=True \
   +teacher_ref_reward_model.model.fsdp_config.param_offload=False \
-  +teacher_ref_reward_model.model.dtype="${MODEL_DTYPE}" \
+  +teacher_ref_reward_model.model.dtype="${TEACHER_DTYPE}" \
   +teacher_ref_reward_model.micro_batch_size_per_gpu=24 \
   custom_reward_function.path="${REPO_ROOT}/verl/verl/utils/reward_score/ttrl_math/__init__.py" \
   custom_reward_function.name=reward_func \
