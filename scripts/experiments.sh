@@ -29,6 +29,12 @@ for arg in "$@"; do
   esac
 done
 
+# ---- eval_ckpt: evaluation-only defaults (must be set before the shared defaults below) ------
+if [ "$NAME" = "eval_ckpt" ]; then
+  export TEST_DATASET=${TEST_DATASET:-"['${REPO_ROOT}/datasets/eval/aime24.parquet','${REPO_ROOT}/datasets/eval/aime25.parquet','${REPO_ROOT}/datasets/eval/hmmt_feb.parquet']"}
+  export VAL_N=${VAL_N:-32}
+fi
+
 # ---- run settings shared by every preset (explicit; override with KEY=VALUE) -----------------
 export GPUS_PER_NODE=${GPUS_PER_NODE:-2}                 # 2x A100 80GB pod
 export MINI_BATCH_SIZE=${MINI_BATCH_SIZE:-64}            # prompts per step (paper: 64), x N_RESPONSES rollouts
@@ -84,6 +90,25 @@ preset() {
     opt_direct_pi_fkl)      # explicit forward-KL loss (gradient-identical to pg; sanity check)
       export REWARD_MODE=prob_delta TARGET_FORM=direct_pi PI_GATE=${PI_GATE:-all} LOSS_FORM=forward_kl
       export VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-False} ;;
+    # ---- evaluation only ---------------------------------------------------------------------
+    eval_ckpt)              # val-only: CKPT=checkpoints/<run>/global_step_N or CKPT=base; AIME24+AIME25+HMMT, n=32
+      if [ -z "${CKPT:-}" ]; then
+        echo "eval_ckpt needs CKPT=checkpoints/<run>/global_step_N (or CKPT=base)" >&2; return 1
+      fi
+      # reward settings only decide which workers get built; nothing is trained
+      export REWARD_MODE=prob_delta TARGET_FORM=direct_pi PI_GATE=all LOSS_FORM=pg
+      export VAL_ONLY=True VAL_BEFORE_TRAIN=True
+      if [ "$CKPT" = "base" ]; then
+        export RESUME_MODE=disable
+        export EXPERIMENT_NAME=${EXPERIMENT_NAME:-eval_base}
+      else
+        if [ ! -d "$CKPT/actor" ]; then
+          echo "no actor checkpoint at $CKPT/actor" >&2; return 1
+        fi
+        CKPT_ABS=$(cd "$CKPT" && pwd)
+        export RESUME_MODE=resume_path RESUME_FROM_PATH=$CKPT_ABS
+        export EXPERIMENT_NAME=${EXPERIMENT_NAME:-eval_$(basename "$(dirname "$CKPT_ABS")")_s${CKPT_ABS##*global_step_}}
+      fi ;;
     *)
       echo "unknown preset: $1 (see --list)" >&2; return 1 ;;
   esac
@@ -94,7 +119,8 @@ preset "$NAME"
 
 echo "[experiments] ${EXPERIMENT_NAME}: REWARD_MODE=${REWARD_MODE} TARGET_FORM=${TARGET_FORM:-n/a} PI_GATE=${PI_GATE:-n/a}" \
      "SUPPORT_FROM=${SUPPORT_FROM:-default} LOSS_FORM=${LOSS_FORM:-n/a} GPUS=${GPUS_PER_NODE} BATCH=${MINI_BATCH_SIZE}" \
-     "STEPS=${TOTAL_TRAINING_STEPS} TEST_FREQ=${TEST_FREQ} VAL_N=${VAL_N} SAVE_FREQ=${SAVE_FREQ} VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN}"
+     "STEPS=${TOTAL_TRAINING_STEPS} TEST_FREQ=${TEST_FREQ} VAL_N=${VAL_N} SAVE_FREQ=${SAVE_FREQ} VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN}" \
+     "VAL_ONLY=${VAL_ONLY:-False} RESUME_MODE=${RESUME_MODE:-auto} RESUME_FROM_PATH=${RESUME_FROM_PATH:-none}"
 if [ "${DRY_RUN:-0}" = "1" ]; then
   echo "[experiments] DRY_RUN=1: TEST_DATASET=${TEST_DATASET} TRAIN_DATASET=${TRAIN_DATASET:-default} PYTHON_BIN=${PYTHON_BIN}"
   exit 0

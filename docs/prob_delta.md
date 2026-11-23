@@ -84,6 +84,26 @@ DRY_RUN=1 bash scripts/experiments.sh p1_direct_opd                 # print sett
 
 Priority 1 = `p1_*`; priority 2 = `p2_*`; priority 3 = `p3_*` (needs teacher pass rates).
 
+## Re-evaluating saved checkpoints
+
+The in-training eval (AIME25 only, 30 problems, n=16) has a standard error of about +-0.015 on
+mean@16, too coarse to separate methods. `eval_ckpt` reloads a saved checkpoint and only runs
+validation, by default on AIME24 + AIME25 + HMMT Feb 2025 (90 problems) with n=32:
+
+```bash
+bash scripts/experiments.sh eval_ckpt CKPT=checkpoints/p1_direct_opd/global_step_120 GPUS_PER_NODE=8
+bash scripts/experiments.sh eval_ckpt CKPT=base GPUS_PER_NODE=8          # untrained Qwen3-4B
+
+# sweep: base + step 120 of the three p1 runs, then a summary table
+bash scripts/eval_sweep.sh "LOGGER=['console','wandb']" PROJECT_NAME=w2s-pi WANDB_ENTITY=<entity>
+RUNS="p1_direct_pi_union p1_direct_opd" STEPS="30 60 90 120" BASE=0 bash scripts/eval_sweep.sh
+bash scripts/eval_sweep.sh --summary                                      # re-print the table
+```
+
+A checkpoint must be loaded on the same GPU count it was saved with (`eval_sweep.sh` defaults to 8).
+Results go to `logs/eval_<run>_s<step>.out` and to W&B as run `eval_<run>_s<step>`, logged at the
+checkpoint's step.
+
 ## Run order (original plan)
 
 | # | Run | Command (env vars) |

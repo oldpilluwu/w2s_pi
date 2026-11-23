@@ -96,6 +96,11 @@ GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 NUM_NODES=${NUM_NODES:-1}
 LOGGER=${LOGGER:-"['console']"}
 VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-True}
+# eval-only runs (scripts/experiments.sh eval_ckpt): VAL_ONLY=True + RESUME_MODE=resume_path
+# + RESUME_FROM_PATH=<abs path>/global_step_N; the checkpoint must be loaded on the GPU count it was saved with
+VAL_ONLY=${VAL_ONLY:-False}
+RESUME_MODE=${RESUME_MODE:-auto}  # auto | disable | resume_path
+RESUME_FROM_PATH=${RESUME_FROM_PATH:-}
 LOG_VAL_GENERATIONS=${LOG_VAL_GENERATIONS:-2}
 VAL_N=${VAL_N:-16}
 SAVE_FREQ=${SAVE_FREQ:-20}
@@ -114,6 +119,11 @@ ROLLOUT_LOG_PROB_MAX_TOKEN_LEN_PER_GPU=${ROLLOUT_LOG_PROB_MAX_TOKEN_LEN_PER_GPU:
 REF_LOG_PROB_MAX_TOKEN_LEN_PER_GPU=${REF_LOG_PROB_MAX_TOKEN_LEN_PER_GPU:-16384}
 ROLLOUT_MAX_NUM_BATCHED_TOKENS=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-${MAX_MODEL_LEN}}
 mkdir -p "${LOG_ROOT}" "${CHECKPOINT_DIR}" "${OUTPUTS_DIR}/validation_log"
+
+RESUME_ARGS=(trainer.resume_mode="${RESUME_MODE}" trainer.val_only="${VAL_ONLY}")
+if [ -n "${RESUME_FROM_PATH}" ]; then
+  RESUME_ARGS+=(trainer.resume_from_path="${RESUME_FROM_PATH}")
+fi
 
 VLLM_ENGINE_OVERRIDES=()
 if [ -n "${VLLM_USE_INDUCTOR}" ]; then
@@ -244,6 +254,7 @@ set +e
   trainer.total_training_steps="${TOTAL_TRAINING_STEPS}" \
   trainer.default_local_dir="${CHECKPOINT_DIR}" \
   trainer.is_plot="${IS_PLOT}" \
+  "${RESUME_ARGS[@]}" \
   "${VLLM_ENGINE_OVERRIDES[@]}" \
   2>&1 | tee -a "${TRAIN_LOG}"
 STATUS=${PIPESTATUS[0]}
