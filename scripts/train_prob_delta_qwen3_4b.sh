@@ -103,18 +103,21 @@ RESUME_MODE=${RESUME_MODE:-auto}  # auto | disable | resume_path
 RESUME_FROM_PATH=${RESUME_FROM_PATH:-}
 # what each actor checkpoint holds:
 #   full    = weights + optimizer + scheduler/RNG (resumable; ~48 GB per checkpoint on 1 GPU for the 4B student)
-#   weights = weights only (enough for eval_ckpt; ~16 GB; a crashed run cannot resume from it)
+#   weights = FSDP weight shards only (enough for eval_ckpt on the same GPU count; ~16 GB; not resumable)
+#   hf      = a plain Hugging Face model in <ckpt>/actor/huggingface (safetensors; evaluate anywhere with
+#             scripts/eval_vllm.py on any GPU count; ~16 GB; not resumable)
 CKPT_CONTENTS=${CKPT_CONTENTS:-full}
 case "${CKPT_CONTENTS}" in
   full) SAVE_CONTENTS="['model','optimizer','extra']" ;;
   weights) SAVE_CONTENTS="['model']" ;;
-  *) echo "CKPT_CONTENTS must be 'full' or 'weights', got '${CKPT_CONTENTS}'" >&2; exit 1 ;;
+  hf) SAVE_CONTENTS="['hf_model']" ;;
+  *) echo "CKPT_CONTENTS must be 'full', 'weights' or 'hf', got '${CKPT_CONTENTS}'" >&2; exit 1 ;;
 esac
 LOAD_CONTENTS=${LOAD_CONTENTS:-${SAVE_CONTENTS}}
-if [ "${CKPT_CONTENTS}" = "weights" ] && [ "${RESUME_MODE}" = "auto" ] && [ "${VAL_ONLY}" != "True" ]; then
+if [ "${CKPT_CONTENTS}" != "full" ] && [ "${RESUME_MODE}" = "auto" ] && [ "${VAL_ONLY}" != "True" ]; then
   # auto-resume from a weights-only checkpoint would silently restart Adam and the LR schedule
   RESUME_MODE=disable
-  echo "[ckpt] CKPT_CONTENTS=weights: auto-resume disabled; rerunning starts from step 0" >&2
+  echo "[ckpt] CKPT_CONTENTS=${CKPT_CONTENTS}: auto-resume disabled; rerunning starts from step 0" >&2
 fi
 LOG_VAL_GENERATIONS=${LOG_VAL_GENERATIONS:-2}
 VAL_N=${VAL_N:-16}

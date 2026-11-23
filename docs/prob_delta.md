@@ -101,6 +101,27 @@ bash scripts/eval_sweep.sh --summary                                      # re-p
 ```
 
 A checkpoint must be loaded on the same GPU count it was saved with (`eval_sweep.sh` defaults to 8).
+
+### Evaluating on a separate machine
+
+To keep the training GPU busy, turn in-training eval off, save plain Hugging Face weights, and
+evaluate them elsewhere with `scripts/eval_vllm.py` (plain vLLM: no Ray, FSDP, teachers, or matching
+GPU count; same prompts, sampling and checker as the in-training eval):
+
+```bash
+# training machine
+bash scripts/experiments.sh p1_nopi_union GPUS_PER_NODE=1 ... CKPT_CONTENTS=hf SAVE_FREQ=30 TEST_FREQ=-1 VAL_BEFORE_TRAIN=False
+# -> checkpoints/p1_nopi_union/global_step_{30,60,90,120}/actor/huggingface  (~16 GB each, safetensors)
+
+# eval machine (same conda env; only the checkpoint and datasets/eval are needed)
+python scripts/eval_vllm.py --model models/Qwen3-4B                                 # base model
+python scripts/eval_vllm.py --model checkpoints/p1_nopi_union/global_step_60 --n 32
+```
+
+Results go to `logs/eval_vllm/<run>_s<step>.json` (mean@N, maj@N, best@N, truncation rate per
+benchmark) plus per-sample `.samples.jsonl`. On a multi-GPU eval machine, run one checkpoint per GPU
+(`CUDA_VISIBLE_DEVICES=i ... &`). `CKPT_CONTENTS=hf` (and `weights`) checkpoints cannot resume a
+crashed run, so auto-resume is off for them.
 Results go to `logs/eval_<run>_s<step>.out` and to W&B as run `eval_<run>_s<step>`, logged at the
 checkpoint's step.
 
