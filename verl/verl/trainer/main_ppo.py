@@ -228,7 +228,9 @@ class TaskRunner:
         """Add reference policy worker if KL loss or KL reward is used."""
         from verl.trainer.ppo.ray_trainer import Role
 
-        if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
+        # prob_delta needs the frozen initial student (pi_S0) as the anchor even when the KL loss is off
+        needs_frozen_student = config.actor_rollout_ref.rollout.get("reward_mode", None) == "prob_delta"
+        if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss or needs_frozen_student:
             self.role_worker_mapping[Role.RefPolicy] = ray.remote(ref_policy_cls)
             self.mapping[Role.RefPolicy] = "global_pool"
 

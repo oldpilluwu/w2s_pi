@@ -828,6 +828,11 @@ class DataParallelPPOActor(BasePPOActor):
             if "student_top_k_log_probs" in select_keys:
                 select_keys.remove("student_top_k_log_probs")   
 
+        # prob_delta forward-KL loss inputs
+        for key in ("prob_delta_target", "prob_delta_valid"):
+            if key in data.batch.keys():
+                select_keys.append(key)
+
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 
@@ -953,6 +958,19 @@ class DataParallelPPOActor(BasePPOActor):
                         format_mask=format_mask,
                     )
                     micro_batch_metrics.update(pg_metrics)
+
+                    # prob_delta with loss_form=forward_kl: replace the policy-gradient surrogate by the
+                    # explicit forward KL(p* || pi_theta renormalised over the support).
+                    if "prob_delta_target" in model_inputs and log_prob_for_loss.dim() == 3:
+                        from verl.trainer.ppo.prob_delta import forward_kl_token_loss
+
+                        fkl_mat = forward_kl_token_loss(
+                            log_prob_for_loss,
+                            model_inputs["prob_delta_target"].to(log_prob_for_loss.dtype),
+                            model_inputs["prob_delta_valid"].bool(),
+                        )
+                        pg_loss = agg_loss(loss_mat=fkl_mat, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        micro_batch_metrics["actor/prob_delta_forward_kl"] = pg_loss.detach().item()
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)

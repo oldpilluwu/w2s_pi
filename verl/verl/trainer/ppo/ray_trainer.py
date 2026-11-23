@@ -77,6 +77,44 @@ def _pop_direct_opd_rollout_options(config) -> dict:
     return options
 
 
+_PROB_DELTA_DEFAULTS = {
+    # decomposed: p* = S0 + a_RL (T - R) + a_PI w (T_gold - T)
+    # direct_pi:  p* = S0 + a_PI w (T_gold - R)          (no plain-teacher passes)
+    "target_form": "decomposed",
+    # pg: policy-gradient surrogate with A = p* - pi_old | forward_kl: explicit KL(p* || pi_theta) loss
+    "loss_form": "pg",
+    "alpha_rl": 1.0,
+    "alpha_pi": 1.0,
+    # none | all | fail | pass | soft  (fail/pass/soft need extra_info.teacher_pass_rate)
+    "pi_gate": "all",
+    "pi_gate_threshold": 0.5,
+    # zero the PI term on the final-answer span so the student is not trained to emit the gold answer
+    "mask_answer_span_for_pi": True,
+    "answer_markers": ["Answer:", "\\boxed{"],
+    # which models contribute candidate ids to the support U
+    "support_from": ["student", "teacher", "teacher_pi", "ref"],
+    # rows per chunk for the driver-side target computation (bounds host memory)
+    "chunk_size": 64,
+}
+
+
+def _prob_delta_options(config) -> dict:
+    user = OmegaConf.select(config, "prob_delta", default=None)
+    opts = dict(_PROB_DELTA_DEFAULTS)
+    if user is not None:
+        opts.update(OmegaConf.to_container(user, resolve=True))
+    unknown = set(opts) - set(_PROB_DELTA_DEFAULTS) - {"enable"}
+    if unknown:
+        raise ValueError(f"Unknown prob_delta options: {sorted(unknown)}")
+    if opts["target_form"] not in ("decomposed", "direct_pi"):
+        raise ValueError(f"prob_delta.target_form must be decomposed|direct_pi, got {opts['target_form']!r}")
+    if opts["loss_form"] not in ("pg", "forward_kl"):
+        raise ValueError(f"prob_delta.loss_form must be pg|forward_kl, got {opts['loss_form']!r}")
+    if opts["target_form"] == "direct_pi" and (float(opts["alpha_pi"]) == 0.0 or opts["pi_gate"] == "none"):
+        raise ValueError("prob_delta.target_form=direct_pi needs alpha_pi != 0 and pi_gate != none")
+    return opts
+
+
 def _build_per_prompt_balanced_indices(num_prompts: int, repeat_times: int, dp_size: int) -> list[int] | None:
     """Build rank-major indices so every rollout DP rank gets the same count per prompt."""
     if num_prompts <= 0 or repeat_times <= 0 or dp_size <= 0:
@@ -642,7 +680,11 @@ class RayPPOTrainer:
         self.reward_mode = self.direct_opd_options["reward_mode"]
         self.use_delta_opd = self.reward_mode == "delta_opd"
         self.use_delta_opd_sampled = self.reward_mode == "delta_opd_sampled"
-        self.use_teacher_ref_scorer = self.use_delta_opd or self.use_delta_opd_sampled
+        self.use_prob_delta = self.reward_mode == "prob_delta"
+        self.prob_delta_cfg = _prob_delta_options(self.config) if self.use_prob_delta else None
+        if self.use_prob_delta and not self.use_reference_policy:
+            raise ValueError("reward_mode=prob_delta needs the frozen reference student (RefPolicy role)")
+        self.use_teacher_ref_scorer = self.use_delta_opd or self.use_delta_opd_sampled or self.use_prob_delta
         if self.use_teacher_ref_scorer and not self.use_rm:
             raise ValueError(f"reward_mode={self.reward_mode} requires the reward model role for teacher scoring")
         if self.use_teacher_ref_scorer and OmegaConf.select(self.config, "teacher_ref_reward_model") is None:
@@ -899,6 +941,155 @@ class RayPPOTrainer:
             swanlab.log({"train/first_generation": table}, step=step)
         except Exception as exc:
             print(f"[train sample] failed to log first generation to SwanLab: {exc}", flush=True)
+
+    # ------------------------------------------------------------------------------------------
+    # prob_delta: probability-space weak-to-strong distillation with privileged information
+    # ------------------------------------------------------------------------------------------
+    def _prob_delta_teacher_call(self, wg, batch: DataProto, gather_ids: torch.Tensor, include_answer: bool):
+        tensors = {
+            k: batch.batch[k]
+            for k in ("input_ids", "attention_mask", "position_ids", "responses", "response_mask", "old_log_probs")
+        }
+        tensors["student_top_k_ids"] = gather_ids
+        tensors["student_top_k_log_probs"] = torch.zeros(gather_ids.shape, dtype=torch.float32)
+        non_tensors = {k: batch.non_tensor_batch[k] for k in ("raw_prompt", "reward_model") if k in batch.non_tensor_batch}
+        meta = dict(batch.meta_info)
+        meta["teacher_include_answer"] = include_answer
+        meta["top_k_strategy"] = "only_stu"
+        out = wg.compute_rm_score(DataProto.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=meta))
+        return out
+
+    def _prob_delta_ids_call(self, fn, batch: DataProto, target_ids: torch.Tensor, key: str) -> torch.Tensor:
+        tensors = {k: batch.batch[k] for k in ("input_ids", "attention_mask", "position_ids", "responses")}
+        tensors["target_ids"] = target_ids
+        out = fn(DataProto.from_dict(tensors=tensors, meta_info=dict(batch.meta_info)))
+        return out.batch[key].float().cpu()
+
+    def _prob_delta_vocab_pieces(self):
+        if not hasattr(self, "_pd_vocab_pieces"):
+            n = len(self.tokenizer)
+            self._pd_vocab_pieces = self.tokenizer.batch_decode([[i] for i in range(n)])
+        return self._pd_vocab_pieces
+
+    def _prob_delta_step(self, batch: DataProto, metrics: dict, timing_raw: dict) -> DataProto:
+        from verl.trainer.ppo import prob_delta as pd
+
+        cfg = self.prob_delta_cfg
+        alpha_rl, alpha_pi = float(cfg["alpha_rl"]), float(cfg["alpha_pi"])
+        direct = cfg["target_form"] == "direct_pi"
+        response_mask = batch.batch["response_mask"].cpu()
+        bsz = response_mask.shape[0]
+
+        # Question-level PI gate -> per-sequence weight
+        pass_rates = None
+        if cfg["pi_gate"] in ("fail", "pass", "soft"):
+            extra = batch.non_tensor_batch.get("extra_info", None)
+            if extra is None:
+                raise KeyError("prob_delta.pi_gate needs non_tensor_batch['extra_info']['teacher_pass_rate']")
+            pass_rates = torch.tensor(
+                [float((e or {}).get("teacher_pass_rate", float("nan"))) for e in extra], dtype=torch.float32
+            )
+        seq_gate = pd.compute_pi_gate(cfg["pi_gate"], pass_rates, cfg["pi_gate_threshold"])
+        if seq_gate is None:
+            seq_gate = torch.full((bsz,), 0.0 if cfg["pi_gate"] == "none" else 1.0)
+        use_pi = direct or (alpha_pi != 0.0 and bool((seq_gate > 0).any()))
+
+        # ---- pass 1: candidate ids from every model ------------------------------------------
+        student_ids = batch.batch["student_top_k_ids"].long().cpu()
+        id_sets = [student_ids]
+        with marked_timer("prob_delta_pass1", timing_raw, color="magenta"):
+            if not direct and "teacher" in cfg["support_from"]:
+                t1 = self._prob_delta_teacher_call(self.rm_wg, batch, student_ids, include_answer=False)
+                id_sets.append(t1.batch["teacher_top_k_ids"].long().cpu())
+            if use_pi and "teacher_pi" in cfg["support_from"]:
+                tf1 = self._prob_delta_teacher_call(self.rm_wg, batch, student_ids, include_answer=True)
+                id_sets.append(tf1.batch["teacher_top_k_ids"].long().cpu())
+            if "ref" in cfg["support_from"]:
+                r1 = self._prob_delta_teacher_call(self.teacher_ref_rm_wg, batch, student_ids, include_answer=False)
+                id_sets.append(r1.batch["teacher_top_k_ids"].long().cpu())
+        union_ids, valid = pd.build_union_support(id_sets)
+
+        # ---- pass 2: every distribution on the shared support --------------------------------
+        with marked_timer("prob_delta_pass2", timing_raw, color="magenta"):
+            logp_t, logp_tf, t2 = None, None, None
+            if not direct:
+                t2 = self._prob_delta_teacher_call(self.rm_wg, batch, union_ids, include_answer=False)
+                logp_t = t2.batch["teacher_on_student_log_probs"].float().cpu()
+            if use_pi:
+                tf2 = self._prob_delta_teacher_call(self.rm_wg, batch, union_ids, include_answer=True)
+                logp_tf = tf2.batch["teacher_on_student_log_probs"].float().cpu()
+                t2 = t2 if t2 is not None else tf2
+            r2 = self._prob_delta_teacher_call(self.teacher_ref_rm_wg, batch, union_ids, include_answer=False)
+            logp_r = r2.batch["teacher_on_student_log_probs"].float().cpu()
+            logp_old = self._prob_delta_ids_call(
+                self.actor_rollout_wg.compute_log_probs_for_ids, batch, union_ids, "student_log_probs_on_teacher_ids"
+            )
+            ref_wg = self.actor_rollout_wg if self.ref_in_actor else self.ref_policy_wg
+            logp_s0 = self._prob_delta_ids_call(
+                ref_wg.compute_ref_log_probs_for_ids, batch, union_ids, "ref_log_probs_on_ids"
+            )
+
+        # ---- per-position PI weight: gate x (not answer span) --------------------------------
+        pi_weight = seq_gate.view(-1, 1).expand_as(response_mask).float().clone()
+        answer_mask = torch.zeros_like(response_mask, dtype=torch.bool)
+        if cfg["mask_answer_span_for_pi"]:
+            answer_mask = pd.answer_span_mask(
+                batch.batch["responses"].cpu(), response_mask, self._prob_delta_vocab_pieces(), cfg["answer_markers"]
+            )
+            pi_weight = pi_weight * (~answer_mask).float()
+
+        # ---- target + advantage (chunked over rows) --------------------------------------------
+        adv_chunks, target_chunks, diag_chunks = [], [], defaultdict(list)
+        step = int(cfg["chunk_size"])
+        for s in range(0, bsz, step):
+            e = min(s + step, bsz)
+            if direct:
+                p_star, diag = pd.compute_direct_pi_target(
+                    logp_s0[s:e], logp_tf[s:e], logp_r[s:e], valid[s:e], alpha=alpha_pi, weight=pi_weight[s:e]
+                )
+            else:
+                p_star, diag = pd.compute_prob_delta_target(
+                    logp_s0[s:e], logp_t[s:e], logp_r[s:e], valid[s:e],
+                    alpha_rl=alpha_rl, alpha_pi=alpha_pi if use_pi else 0.0,
+                    logp_t_pi=logp_tf[s:e] if logp_tf is not None else None, pi_weight=pi_weight[s:e],
+                )
+            adv, adv_diag = pd.compute_prob_delta_advantage(p_star, logp_old[s:e], valid[s:e], response_mask[s:e])
+            adv_chunks.append(adv)
+            if cfg["loss_form"] == "forward_kl":
+                target_chunks.append(p_star)
+            for k, v in {**diag, **adv_diag}.items():
+                diag_chunks[k].append(v)
+        advantages = torch.cat(adv_chunks, dim=0)
+        diag = {k: torch.cat(v, dim=0) for k, v in diag_chunks.items()}
+
+        # ---- hand off to the existing top-k update ----------------------------------------------
+        batch.batch["union_top_k_ids"] = union_ids
+        batch.batch["union_top_k_log_probs"] = logp_old
+        batch.batch["rm_scores"] = advantages
+        if cfg["loss_form"] == "forward_kl":
+            batch.batch["prob_delta_target"] = torch.cat(target_chunks, dim=0)
+            batch.batch["prob_delta_valid"] = valid
+
+        # ---- metrics ---------------------------------------------------------------------------
+        m = response_mask.bool()
+        pi_pos = m & (pi_weight > 0)
+        reason_pos = m & ~answer_mask
+        ans_pos = m & answer_mask
+        for k, v in diag.items():
+            metrics[f"prob_delta/{k}"] = pd.masked_position_mean(v, m)
+        if use_pi:
+            tv_key = "tv_direct" if direct else "tv_pi"
+            metrics[f"prob_delta/{tv_key}_on_gated"] = pd.masked_position_mean(diag[tv_key], pi_pos)
+            metrics[f"prob_delta/{tv_key}_reasoning_span"] = pd.masked_position_mean(diag[tv_key], reason_pos)
+            metrics[f"prob_delta/{tv_key}_answer_span_unmasked"] = pd.masked_position_mean(diag[tv_key], ans_pos)
+        metrics["prob_delta/pi_gate_frac_sequences"] = float((seq_gate > 0).float().mean())
+        metrics["prob_delta/answer_span_frac_tokens"] = pd.masked_position_mean(answer_mask.float(), m)
+        metrics["prob_delta/adv_abs_sum"] = pd.masked_position_mean(advantages.abs().sum(-1), m)
+        if "teacher_unmappable_response" in t2.batch.keys():
+            metrics["prob_delta/teacher_unmappable_response_frac"] = pd.masked_position_mean(
+                t2.batch["teacher_unmappable_response"].float().cpu(), m
+            )
+        return batch
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
@@ -1599,11 +1790,17 @@ class RayPPOTrainer:
                             batch.meta_info["reward_mode"] = reward_mode
                             batch.meta_info["top_p_intersec_p"] = self.config.actor_rollout_ref.rollout.get("top_p_intersec_p", 0.99)
                             
-                            with marked_timer("compute_rm_score", timing_raw, color="magenta"):
-                                teacher_data = self.rm_wg.compute_rm_score(batch)
-                                batch = batch.union(teacher_data)
+                            if reward_mode != "prob_delta":
+                                with marked_timer("compute_rm_score", timing_raw, color="magenta"):
+                                    teacher_data = self.rm_wg.compute_rm_score(batch)
+                                    batch = batch.union(teacher_data)
 
-                            if reward_mode == "delta_opd_sampled":
+                            if reward_mode == "prob_delta":
+                                if top_k <= 0:
+                                    raise ValueError("reward_mode=prob_delta requires rollout.log_prob_top_k > 0")
+                                with marked_timer("prob_delta", timing_raw, color="orange"):
+                                    batch = self._prob_delta_step(batch, metrics, timing_raw)
+                            elif reward_mode == "delta_opd_sampled":
                                 if self.teacher_ref_rm_wg is None:
                                     raise ValueError("reward_mode=delta_opd_sampled requires teacher_ref_rm_wg")
                                 with marked_timer("compute_teacher_ref_rm_score", timing_raw, color="magenta"):
@@ -1907,7 +2104,8 @@ class RayPPOTrainer:
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
-                    if self.use_reference_policy:
+                    skip_sampled_ref = self.use_prob_delta and not self.config.actor_rollout_ref.actor.use_kl_loss
+                    if self.use_reference_policy and not skip_sampled_ref:
                         # compute reference log_prob
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
                             if not self.ref_in_actor:

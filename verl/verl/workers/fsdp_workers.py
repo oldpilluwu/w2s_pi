@@ -1154,6 +1154,26 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         return output
 
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="olive", role="ref_compute_log_probs_for_ids")
+    def compute_ref_log_probs_for_ids(self, data: DataProto):
+        """prob_delta: frozen initial student (pi_S0) log-probs at data.batch['target_ids'] (B, T, K)."""
+        assert self._is_ref and not self._is_lora, "prob_delta needs a standalone frozen reference student"
+        data.meta_info["micro_batch_size"] = self.config.ref.log_prob_micro_batch_size_per_gpu
+        data.meta_info["temperature"] = self.config.rollout.temperature
+        data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
+        with self.ulysses_sharding_manager:
+            output = self.ref_policy.compute_log_probs_for_ids(data=data)
+            output = DataProto.from_dict(tensors={"ref_log_probs_on_ids": output})
+
+        if self.world_size > 1:
+            if fsdp_version(self.ref_policy.actor_module) == 1:
+                self.ref_policy.actor_module._handle.reshard(True)
+            elif fsdp_version(self.ref_policy.actor_module) == 2:
+                self.ref_policy.actor_module.reshard()
+        return output
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
         from verl.utils.logger import log_with_rank
@@ -1779,6 +1799,34 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 input_tokenizer_local_path, trust_remote_code=config.model.get("trust_remote_code", False)
             )
             self.tokenizer = hf_tokenizer(local_path, trust_remote_code=config.model.get("trust_remote_code", False))
+
+        # prob_delta: score the student's response token-for-token, but with the prompt rendered in the
+        # teacher's OWN chat template (optionally with the gold answer as privileged information).
+        self._own_template = self.config.get("teacher_input_mode", "student_tokens") == "own_template"
+        if self._own_template:
+            if self._do_switch_chat_template:
+                raise ValueError("teacher_input_mode=own_template is incompatible with model.input_tokenizer")
+            from verl.trainer.ppo.prob_delta import build_vocab_maps
+
+            student_tok_path = self.config.get("student_tokenizer", None)
+            if student_tok_path is None:
+                raise ValueError("teacher_input_mode=own_template requires reward_model.student_tokenizer")
+            trc = config.model.get("trust_remote_code", False)
+            self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trc)
+            self.student_tokenizer = hf_tokenizer(copy_to_local(student_tok_path, use_shm=use_shm), trust_remote_code=trc)
+            overrides = dict(self.config.get("special_token_map", None) or {})
+            # default: the student's end-of-turn token means the teacher's end-of-sequence token
+            s_eos, t_eos = self.student_tokenizer.eos_token, self.tokenizer.eos_token
+            if s_eos and t_eos and s_eos not in overrides:
+                overrides[s_eos] = t_eos
+            self._s2t, self._t2s = build_vocab_maps(
+                self.student_tokenizer.get_vocab(), self.tokenizer.get_vocab(), overrides=overrides
+            )
+            if self.tokenizer.pad_token_id is None:
+                self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+            if self.rank == 0:
+                unmapped = int((self._s2t < 0).sum())
+                print(f"[prob_delta] teacher own-template inputs: {unmapped} student ids have no teacher counterpart")
 
         trust_remote_code = config.model.get("trust_remote_code", False)
         model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
@@ -2622,6 +2670,50 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
         return DataProto.from_dict(rm_inputs)
 
+    def _build_own_template_inputs(self, data: DataProto, include_answer: bool):
+        """prob_delta teacher inputs: teacher-template prompt (+ optional gold-answer hint) followed by
+        the student's response ids mapped into the teacher vocabulary. No decode/re-encode of the
+        response, so teacher log-probs line up with student positions exactly."""
+        from verl.trainer.ppo.prob_delta import (
+            add_answer_hint,
+            assemble_teacher_batch,
+            remap_ids,
+            strip_prompt_response_overlap,
+        )
+
+        if "raw_prompt" not in data.non_tensor_batch:
+            raise KeyError("teacher_input_mode=own_template needs data.return_raw_chat=True (raw_prompt missing)")
+        if include_answer and "reward_model" not in data.non_tensor_batch:
+            raise KeyError("PI teacher needs non_tensor_batch['reward_model']['ground_truth']")
+
+        responses = data.batch["responses"]
+        resp_len = responses.shape[-1]
+        resp_attn = data.batch["attention_mask"][:, -resp_len:]
+        teacher_resp = remap_ids(responses.long().cpu(), self._s2t)
+        unmappable = (teacher_resp < 0) & (resp_attn.cpu() > 0)
+        fallback_id = self.tokenizer.eos_token_id
+        teacher_resp = torch.where(teacher_resp < 0, torch.full_like(teacher_resp, fallback_id), teacher_resp)
+
+        hint_template = self.config.get(
+            "answer_hint_template", "\n\n(Privileged hint: the correct final answer is {answer}.)"
+        )
+        thinking = self.config.get("teacher_enable_thinking", None)
+        template_kwargs = {} if thinking is None else {"enable_thinking": bool(thinking)}
+        prompt_ids = []
+        for i in range(responses.shape[0]):
+            chat = list(data.non_tensor_batch["raw_prompt"][i])
+            if include_answer:
+                gt = data.non_tensor_batch["reward_model"][i]["ground_truth"]
+                chat = add_answer_hint(chat, str(gt), hint_template)
+            text = self.tokenizer.apply_chat_template(chat, add_generation_prompt=True, tokenize=False, **template_kwargs)
+            ids = self.tokenizer(text, add_special_tokens=False)["input_ids"]
+            n_valid = int(resp_attn[i].sum())
+            ids = strip_prompt_response_overlap(list(ids), teacher_resp[i, :n_valid].tolist())
+            prompt_ids.append(ids)
+
+        tensors = assemble_teacher_batch(prompt_ids, teacher_resp, resp_attn, self.tokenizer.pad_token_id)
+        return DataProto.from_dict(tensors), unmappable
+
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="reward"))
     @DistProfiler.annotate(color="brown")
     def compute_rm_score(self, data: DataProto, kl_estimator="k1"):
@@ -2655,6 +2747,10 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             if self.rank == 0:
                 print(f"Chat template switching is ENABLED (token-level aligned, left-padded).")
             rm_data = self._switch_chat_template_token_level(data)
+        elif getattr(self, "_own_template", False):
+            rm_data, response_unmappable = self._build_own_template_inputs(
+                data, include_answer=bool(data.meta_info.get("teacher_include_answer", False))
+            )
         else:
             rm_inputs = {
                 "input_ids": data.batch["input_ids"],
@@ -2666,7 +2762,15 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
         # Support all hardwares
         rm_data = rm_data.to(get_device_id())
-        
+
+        gather_unmappable = None
+        if student_top_k_ids is not None and getattr(self, "_own_template", False):
+            from verl.trainer.ppo.prob_delta import remap_ids
+
+            mapped = remap_ids(student_top_k_ids.long(), self._s2t)
+            gather_unmappable = mapped < 0
+            student_top_k_ids = torch.where(gather_unmappable, torch.zeros_like(mapped), mapped)
+
         if student_top_k_ids is not None:
              rm_data.batch["student_top_k_ids"] = student_top_k_ids
 
@@ -2799,9 +2903,23 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 teacher_valid_counts = None
                 overlap_mask = None
             
+            if getattr(self, "_own_template", False):
+                from verl.trainer.ppo.prob_delta import remap_ids
+
+                # back to the student's id space / mark ids the teacher vocabulary does not have.
+                # Finite fill (prob ~ 0) so that delta_opd's log-ratio stays 0 instead of NaN (-inf - -inf).
+                if teacher_on_student_logp is not None and gather_unmappable is not None:
+                    teacher_on_student_logp = teacher_on_student_logp.masked_fill(
+                        gather_unmappable.to(teacher_on_student_logp.device), -1.0e4
+                    )
+                if teacher_top_k_ids is not None:
+                    teacher_top_k_ids = remap_ids(teacher_top_k_ids.long(), self._t2s)
+
             tensors = {}
             if rm_scores is not None:
                 tensors["rm_scores"] = rm_scores
+            if getattr(self, "_own_template", False):
+                tensors["teacher_unmappable_response"] = response_unmappable.to(teacher_logp.device)
 
             tensors["teacher_sampled_log_probs"] = teacher_logp
             
