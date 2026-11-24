@@ -29,11 +29,13 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-RUN_ORDER = ["p1_direct_pi_union", "p1_nopi_union", "p1_direct_opd", "p2_direct_pi_student", "p2_decomposed_union"]
+RUN_ORDER = ["p1_direct_pi_union", "p1_nopi_union", "p1_direct_opd", "opd_pi_2k_a3", "p2_direct_pi_student",
+             "p2_decomposed_union"]
 SHORT = {
     "p1_direct_pi_union": "dpiU",
     "p1_nopi_union": "nopiU",
     "p1_direct_opd": "OPD",
+    "opd_pi_2k_a3": "piOPD",
     "p2_direct_pi_student": "dpiS",
     "p2_decomposed_union": "decU",
     "p2_nopi_student": "nopiS",
@@ -42,6 +44,7 @@ NUM = re.compile(r"^(?:np\.float64\()?(-?(?:[0-9.]+(?:e[-+]?\d+)?|nan|inf))\)?$"
 WINDOWS = [(1, 5), (6, 30), (31, 60), (61, 90), (91, 120), (121, 150)]
 TRAIN_PREFIXES = (
     "delta_opd/",
+    "opd_pi/",
     "critic/advantages/",
     "critic/rewards/",
     "teacher",
@@ -265,7 +268,7 @@ def validation_section(args, runs, problems, dumps):
             pooled[run] = problem_acc(recs)
     cols = [r for r in runs if r in pooled]
     opd = "p1_direct_opd" if "p1_direct_opd" in pooled else None
-    pd_runs = [r for r in cols if r != opd]
+    pd_runs = [r for r in cols if r != opd and not r.startswith("opd_pi")]
 
     print("\nPER-PROBLEM ACCURACY (pooled over evals after step 0; base = step 0)")
     print(f"{'#':>3} {'src':>7} {'gt':>8} {'base':>5} " + " ".join(f"{SHORT.get(r, r[:6]):>6}" for r in cols)
@@ -409,7 +412,7 @@ def drift_section(args, runs, problems, loaded):
 def main(argv=None):
     args = parse_args(argv)
     dumps = find_dumps(args.ckpt_root, args.runs)
-    log_runs = [p.stem for p in args.logs.glob("p[0-9]_*.out")]
+    log_runs = [p.stem for pat in ("p[0-9]_*.out", "opd_pi_*.out") for p in args.logs.glob(pat)]
     runs = ordered(set(args.runs or (list(dumps) + log_runs)))
     training_section(args, runs)
     problems = load_problems(args.eval_data)
