@@ -34,6 +34,13 @@ if [ "$NAME" = "eval_ckpt" ]; then
   export TEST_DATASET=${TEST_DATASET:-"['${REPO_ROOT}/datasets/eval/aime24.parquet','${REPO_ROOT}/datasets/eval/aime25.parquet','${REPO_ROOT}/datasets/eval/hmmt_feb.parquet']"}
   export VAL_N=${VAL_N:-32}
 fi
+# ---- PI-OPD: preflight is a short run with no eval/checkpoint; opd_pi_2k stops at 90 steps ----
+if [ "$NAME" = "pre_opd_pi" ]; then
+  export TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-10} TEST_FREQ=${TEST_FREQ:--1} SAVE_FREQ=${SAVE_FREQ:--1}
+fi
+if [ "$NAME" = "opd_pi_2k" ]; then
+  export TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-90}
+fi
 
 # ---- run settings shared by every preset (explicit; override with KEY=VALUE) -----------------
 export GPUS_PER_NODE=${GPUS_PER_NODE:-2}                 # 2x A100 80GB pod
@@ -87,6 +94,14 @@ preset() {
     p3_direct_pi_pass)
       export REWARD_MODE=prob_delta TARGET_FORM=direct_pi PI_GATE=pass TRAIN_DATASET=${TRAIN_DATASET:-$PASSRATE_DATASET}
       export VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-False} ;;
+    # ---- PI-OPD: Direct-OPD + privileged-answer log-ratio term ---------------------------------
+    pre_opd_pi)             # preflight: Direct-OPD unchanged, PI term only logged (opd_pi/*), 10 steps
+      export REWARD_MODE=delta_opd OPD_PI_ALPHA=0 OPD_PI_SHADOW=True
+      export VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-False} ;;
+    opd_pi_2k)              # reward = pi_hat*[(log T - log R) + a*w*clip(log T_gold - log T)], 2048 tokens
+      export REWARD_MODE=delta_opd OPD_PI_ALPHA=${OPD_PI_ALPHA:-1.0} OPD_PI_CLIP=${OPD_PI_CLIP:-2.0} OPD_PI_SHADOW=False
+      export PI_GATE=${PI_GATE:-all} MASK_ANSWER_SPAN_FOR_PI=${MASK_ANSWER_SPAN_FOR_PI:-True}
+      export VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-False} ;;
     # ---- optional ----------------------------------------------------------------------------
     opt_direct_pi_fkl)      # explicit forward-KL loss (gradient-identical to pg; sanity check)
       export REWARD_MODE=prob_delta TARGET_FORM=direct_pi PI_GATE=${PI_GATE:-all} LOSS_FORM=forward_kl
@@ -123,7 +138,8 @@ echo "[experiments] ${EXPERIMENT_NAME}: REWARD_MODE=${REWARD_MODE} TARGET_FORM=$
      "SUPPORT_FROM=${SUPPORT_FROM:-default} LOSS_FORM=${LOSS_FORM:-n/a} GPUS=${GPUS_PER_NODE} BATCH=${MINI_BATCH_SIZE}" \
      "STEPS=${TOTAL_TRAINING_STEPS} TEST_FREQ=${TEST_FREQ} VAL_N=${VAL_N} SAVE_FREQ=${SAVE_FREQ} VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN}" \
      "VAL_ONLY=${VAL_ONLY:-False} RESUME_MODE=${RESUME_MODE:-auto} RESUME_FROM_PATH=${RESUME_FROM_PATH:-none}" \
-     "CKPT_CONTENTS=${CKPT_CONTENTS} LOAD_CONTENTS=${LOAD_CONTENTS:-same}"
+     "CKPT_CONTENTS=${CKPT_CONTENTS} LOAD_CONTENTS=${LOAD_CONTENTS:-same}" \
+     "OPD_PI_ALPHA=${OPD_PI_ALPHA:-0} OPD_PI_CLIP=${OPD_PI_CLIP:-2.0} OPD_PI_SHADOW=${OPD_PI_SHADOW:-False}"
 if [ "${DRY_RUN:-0}" = "1" ]; then
   echo "[experiments] DRY_RUN=1: TEST_DATASET=${TEST_DATASET} TRAIN_DATASET=${TRAIN_DATASET:-default} PYTHON_BIN=${PYTHON_BIN}"
   exit 0

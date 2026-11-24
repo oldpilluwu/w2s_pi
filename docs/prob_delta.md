@@ -140,6 +140,41 @@ crashed run, so auto-resume is off for them.
 Results go to `logs/eval_<run>_s<step>.out` and to W&B as run `eval_<run>_s<step>`, logged at the
 checkpoint's step.
 
+## PI-OPD: Direct-OPD plus the privileged answer in log space
+
+Direct-OPD's top-k reward is `pi_hat_k (log T_k - log R_k)` on the student's top-k, where `pi_hat` is
+the student's renormalised top-k probability. With one on-policy update this is the policy gradient of
+`E_pi[log T - log R]`, the teacher's implicit RL reward, applied to the student's own distribution
+(`test_opd_reward_gradient_is_expected_log_ratio_gradient`). PI-OPD adds one term:
+
+```
+A_k = pi_hat_k [ (log T_k - log R_k) + a * w_t * clip(log T_k(.|gold) - log T_k, -c, c) ]
+```
+
+`w_t` = question gate (`PI_GATE`) x not-in-answer-span (`MASK_ANSWER_SPAN_FOR_PI`). The KL loss and its
+adaptive coefficient are Direct-OPD's, and the coefficient keeps following the RL-only reward
+(`delta_opd/weighted_reward_mean`). With `a = 1`, no clip and no mask the reward is
+`pi_hat (log T_gold - log R)`. Cost: one extra teacher pass (gold-answer hint) on the student top-k.
+
+```bash
+# preflight: Direct-OPD unchanged, the PI term only measured (opd_pi/*), 10 steps, no eval/checkpoint
+bash scripts/experiments.sh pre_opd_pi GPUS_PER_NODE=8
+# the run (90 steps by default); set OPD_PI_ALPHA / OPD_PI_CLIP from the preflight
+bash scripts/experiments.sh opd_pi_2k GPUS_PER_NODE=8 OPD_PI_ALPHA=1.0 OPD_PI_CLIP=2.0
+```
+
+Preflight metrics (`opd_pi/*`, all weighted by `pi_hat`, per response position):
+
+| metric | meaning |
+|---|---|
+| `pi_abs_wmean`, `rl_abs_wmean` | size of the PI term vs the RL term |
+| `pi_abs_wmean_reasoning` / `_answer_span` | PI size outside / inside the answer span |
+| `pi_gt_rl_frac` | share of positions where the PI term is larger than the RL term |
+| `pi_wmean`, `rl_wmean`, `corr_pi_rl` | signed means and their per-position correlation |
+| `pi_abs_wmean_p99`, `pi_raw_absmax_p99` | tails, to choose the clip |
+| `clipped_weight_frac` | probability mass whose PI log-ratio exceeds the clip |
+| `applied_abs_mean` | the PI reward actually added (0 in the preflight) |
+
 ## Run order (original plan)
 
 | # | Run | Command (env vars) |

@@ -56,6 +56,12 @@ ALPHA_PI=${ALPHA_PI:-1.0}
 PI_GATE=${PI_GATE:-all}  # none | all | fail | pass | soft (fail/pass/soft need extra_info.teacher_pass_rate)
 PI_GATE_THRESHOLD=${PI_GATE_THRESHOLD:-0.5}
 MASK_ANSWER_SPAN_FOR_PI=${MASK_ANSWER_SPAN_FOR_PI:-True}
+# PI-OPD (REWARD_MODE=delta_opd only): reward += OPD_PI_ALPHA * pi_hat * clip(log T(.|gold) - log T, +-OPD_PI_CLIP)
+# on the student's top-k, answer span masked (MASK_ANSWER_SPAN_FOR_PI), gated by PI_GATE.
+# OPD_PI_SHADOW=True logs opd_pi/* without changing the reward (preflight).
+OPD_PI_ALPHA=${OPD_PI_ALPHA:-0.0}
+OPD_PI_CLIP=${OPD_PI_CLIP:-2.0}
+OPD_PI_SHADOW=${OPD_PI_SHADOW:-False}
 ENABLE_THINKING=${ENABLE_THINKING:-True}  # Direct-OPD Table 1 Qwen3 baselines match thinking mode
 TEACHER_INPUT_MODE=${TEACHER_INPUT_MODE:-own_template}  # own_template | student_tokens
 GRPO_OUTCOME_WEIGHT=${GRPO_OUTCOME_WEIGHT:-1.0}
@@ -263,6 +269,12 @@ set +e
   +prob_delta.support_from="${SUPPORT_FROM}" \
   +prob_delta.target_form="${TARGET_FORM}" \
   +prob_delta.loss_form="${LOSS_FORM}" \
+  +opd_pi.alpha="${OPD_PI_ALPHA}" \
+  +opd_pi.clip="${OPD_PI_CLIP}" \
+  +opd_pi.shadow="${OPD_PI_SHADOW}" \
+  +opd_pi.mask_answer_span="${MASK_ANSWER_SPAN_FOR_PI}" \
+  +opd_pi.pi_gate="${PI_GATE}" \
+  +opd_pi.pi_gate_threshold="${PI_GATE_THRESHOLD}" \
   reward_model.model.path="${REWARD_MODEL_PATH}" \
   reward_model.model.input_tokenizer=null \
   reward_model.model.use_remove_padding=True \

@@ -216,6 +216,92 @@ def compute_prob_delta_advantage(
 
 
 # --------------------------------------------------------------------------------------------
+# PI-OPD: Direct-OPD's log-ratio reward plus a privileged-information log-ratio term
+# --------------------------------------------------------------------------------------------
+def student_topk_weights(student_logp: torch.Tensor) -> torch.Tensor:
+    """Direct-OPD's detached weights: softmax of the student's top-k log-probs (renormalised)."""
+    w = torch.softmax(student_logp.detach().float(), dim=-1)
+    return torch.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def compute_opd_pi_terms(
+    student_logp: torch.Tensor,
+    logp_t: torch.Tensor,
+    logp_t_pi: torch.Tensor,
+    pi_weight: torch.Tensor,
+    alpha: float,
+    clip: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """PI term added to Direct-OPD's top-k reward.
+
+        rm_pi[b, t, k] = alpha * w_PI[b, t] * pi_hat[b, t, k] * clip(log T(k | gold) - log T(k), -clip, clip)
+
+    All log-prob tensors are (B, T, K) on the student's top-k ids; pi_hat are Direct-OPD's student
+    weights, so tokens the student finds unlikely get almost no push (guards against answer leakage).
+    ``pi_weight`` is (B, T) in [0, 1] (question gate x not-answer-span). ``clip <= 0`` disables clipping.
+    With alpha = 1, no clip and w_PI = 1, Direct-OPD's reward plus this term equals
+    pi_hat * (log T(.|gold) - log R).
+
+    Returns (rm_pi, delta_pi) where delta_pi is the unclipped log-ratio, both (B, T, K) float32.
+    """
+    delta_pi = torch.nan_to_num((logp_t_pi.float() - logp_t.float()).detach(), nan=0.0, posinf=0.0, neginf=0.0)
+    clipped = delta_pi.clamp(-clip, clip) if clip > 0 else delta_pi
+    w = student_topk_weights(student_logp)
+    rm_pi = float(alpha) * pi_weight.float().unsqueeze(-1) * w * clipped
+    return rm_pi, delta_pi
+
+
+def opd_pi_metrics(
+    student_logp: torch.Tensor,
+    logp_t: torch.Tensor,
+    logp_r: torch.Tensor,
+    delta_pi: torch.Tensor,
+    rm_pi: torch.Tensor,
+    response_mask: torch.Tensor,
+    answer_mask: torch.Tensor,
+    clip: float,
+) -> dict[str, float]:
+    """Size of the PI log-ratio next to Direct-OPD's RL log-ratio, both weighted by pi_hat.
+
+    Logged with or without the PI term in the loss (shadow mode), to choose alpha and the clip."""
+    w = student_topk_weights(student_logp)
+    delta_rl = (logp_t.float() - logp_r.float()).detach()
+    pi_abs = (w * delta_pi.abs()).sum(-1)  # (B, T)
+    rl_abs = (w * delta_rl.abs()).sum(-1)
+    pi_signed = (w * delta_pi).sum(-1)
+    rl_signed = (w * delta_rl).sum(-1)
+    m = response_mask.bool()
+    reason = m & ~answer_mask.bool()
+    ans = m & answer_mask.bool()
+
+    out = {
+        "opd_pi/pi_abs_wmean": masked_position_mean(pi_abs, m),
+        "opd_pi/rl_abs_wmean": masked_position_mean(rl_abs, m),
+        "opd_pi/pi_wmean": masked_position_mean(pi_signed, m),
+        "opd_pi/rl_wmean": masked_position_mean(rl_signed, m),
+        "opd_pi/pi_abs_wmean_reasoning": masked_position_mean(pi_abs, reason),
+        "opd_pi/pi_abs_wmean_answer_span": masked_position_mean(pi_abs, ans),
+        "opd_pi/pi_gt_rl_frac": masked_position_mean((pi_abs > rl_abs).float(), m),
+        "opd_pi/answer_span_frac_tokens": masked_position_mean(answer_mask.float(), m),
+        "opd_pi/applied_abs_mean": masked_position_mean(rm_pi.abs().sum(-1), m),
+    }
+    if clip > 0:
+        out["opd_pi/clipped_weight_frac"] = masked_position_mean((w * (delta_pi.abs() > clip).float()).sum(-1), m)
+    if m.any():
+        vals = pi_abs[m]
+        raw_max = delta_pi.abs().amax(-1)[m]
+        if vals.numel() > 1_000_000:  # torch.quantile input limit; a strided sample is enough
+            stride = vals.numel() // 1_000_000 + 1
+            vals, raw_max = vals[::stride], raw_max[::stride]
+        out["opd_pi/pi_abs_wmean_p99"] = float(torch.quantile(vals, 0.99))
+        out["opd_pi/pi_raw_absmax_p99"] = float(torch.quantile(raw_max, 0.99))
+        x, y = pi_signed[m].double(), rl_signed[m].double()
+        if x.numel() > 1 and x.std() > 0 and y.std() > 0:
+            out["opd_pi/corr_pi_rl"] = float(torch.corrcoef(torch.stack([x, y]))[0, 1])
+    return out
+
+
+# --------------------------------------------------------------------------------------------
 # Privileged-information gating
 # --------------------------------------------------------------------------------------------
 def compute_pi_gate(gate: str, teacher_pass_rate: torch.Tensor | None, threshold: float = 0.5) -> torch.Tensor | None:

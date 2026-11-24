@@ -254,3 +254,78 @@ def test_add_answer_hint_targets_last_user_turn_and_copies():
     assert chat[1]["content"] == "q"
     with pytest.raises(ValueError):
         pd.add_answer_hint([{"role": "system", "content": "s"}], "1", "{answer}")
+
+
+# ---------------------------------------------------------------------------------------- PI-OPD
+def _rand_logp(*shape, seed):
+    g = torch.Generator().manual_seed(seed)
+    return torch.log_softmax(torch.randn(*shape, generator=g) * 2, dim=-1)
+
+
+def test_opd_pi_alpha_zero_adds_nothing_but_returns_delta():
+    s, t, tpi = (_rand_logp(2, 3, 4, seed=i) for i in range(3))
+    rm, delta = pd.compute_opd_pi_terms(s, t, tpi, torch.ones(2, 3), alpha=0.0, clip=2.0)
+    assert torch.count_nonzero(rm) == 0
+    assert torch.allclose(delta, tpi - t)
+
+
+def test_opd_pi_plus_direct_opd_equals_direct_form():
+    # alpha=1, no clip, gate 1: pi_hat*(T - R) + pi_hat*(T_gold - T) == pi_hat*(T_gold - R)
+    s, t, tpi, r = (_rand_logp(2, 5, 6, seed=i) for i in range(4))
+    w = torch.softmax(s, -1)
+    rm_rl = w * (t - r)  # Direct-OPD (dp_actor._compute_delta_opd_rm_scores)
+    rm_pi, _ = pd.compute_opd_pi_terms(s, t, tpi, torch.ones(2, 5), alpha=1.0, clip=0.0)
+    assert torch.allclose(rm_rl + rm_pi, w * (tpi - r), atol=1e-6)
+
+
+def test_opd_pi_clip_and_position_weight():
+    s = torch.log(torch.tensor([[[0.5, 0.5], [0.5, 0.5]]]))
+    t = torch.log(torch.tensor([[[0.5, 0.5], [0.5, 0.5]]]))
+    tpi = torch.tensor([[[0.0, -20.0], [0.0, -20.0]]])  # log-ratios ~ +0.69 and ~ -19.3
+    weight = torch.tensor([[1.0, 0.0]])  # second position masked (e.g. answer span)
+    rm, delta = pd.compute_opd_pi_terms(s, t, tpi, weight, alpha=2.0, clip=2.0)
+    assert torch.allclose(rm[0, 0], torch.tensor([2.0 * 0.5 * (0.0 - torch.log(torch.tensor(0.5))), 2.0 * 0.5 * -2.0]))
+    assert torch.count_nonzero(rm[0, 1]) == 0
+    assert delta[0, 0, 1] < -19  # delta is returned unclipped
+
+
+def test_opd_pi_unmappable_and_nonfinite_give_zero():
+    s = _rand_logp(1, 2, 3, seed=0)
+    t = torch.tensor([[[-1e4, -1.0, -2.0], [-float("inf"), -1.0, -2.0]]])
+    tpi = torch.tensor([[[-1e4, -0.5, -2.0], [-float("inf"), -0.5, -2.0]]])
+    rm, delta = pd.compute_opd_pi_terms(s, t, tpi, torch.ones(1, 2), alpha=1.0, clip=2.0)
+    assert torch.isfinite(rm).all() and torch.isfinite(delta).all()
+    assert delta[0, 0, 0] == 0 and delta[0, 1, 0] == 0
+
+
+def test_opd_reward_gradient_is_expected_log_ratio_gradient():
+    # On-policy, a top-k reward pi_hat * D with surrogate -sum_k A_k log pi_k has the gradient of
+    # -E_pi[D] (exact expectation over the support): Direct-OPD / PI-OPD maximise the expected log-ratio.
+    torch.manual_seed(0)
+    logits = torch.randn(3, 5, requires_grad=True)
+    d = torch.randn(3, 5)
+    logp = torch.log_softmax(logits, -1)
+    adv = torch.softmax(logits.detach(), -1) * d
+    (g_surrogate,) = torch.autograd.grad(-(adv * logp).sum(), logits)
+    (g_expected,) = torch.autograd.grad(-(torch.softmax(logits, -1) * d).sum(), logits)
+    assert torch.allclose(g_surrogate, g_expected, atol=1e-6)
+
+
+def test_opd_pi_metrics_values():
+    s = torch.log(torch.tensor([[[0.75, 0.25], [0.75, 0.25], [0.75, 0.25]]]))
+    t = torch.zeros(1, 3, 2)
+    r = torch.full((1, 3, 2), -0.1)  # rl log-ratio 0.1 everywhere
+    tpi = torch.tensor([[[1.0, 0.0], [3.0, 0.0], [0.0, 0.0]]])  # pi log-ratio 1, 3 (clipped at 2), 0
+    mask = torch.tensor([[1, 1, 0]])  # third position is padding
+    answer = torch.tensor([[False, True, False]])
+    rm, delta = pd.compute_opd_pi_terms(s, t, tpi, mask.float() * (~answer).float(), alpha=1.0, clip=2.0)
+    m = pd.opd_pi_metrics(s, t, r, delta, rm, mask, answer, clip=2.0)
+    assert m["opd_pi/pi_abs_wmean"] == pytest.approx((0.75 + 2.25) / 2)
+    assert m["opd_pi/rl_abs_wmean"] == pytest.approx(0.1)
+    assert m["opd_pi/pi_abs_wmean_reasoning"] == pytest.approx(0.75)
+    assert m["opd_pi/pi_abs_wmean_answer_span"] == pytest.approx(2.25)
+    assert m["opd_pi/pi_gt_rl_frac"] == pytest.approx(1.0)
+    assert m["opd_pi/answer_span_frac_tokens"] == pytest.approx(0.5)
+    assert m["opd_pi/clipped_weight_frac"] == pytest.approx(0.75 / 2)  # only the 3.0 entry, weight 0.75
+    assert m["opd_pi/applied_abs_mean"] == pytest.approx(0.75 / 2)  # answer position masked
+    assert m["opd_pi/pi_raw_absmax_p99"] == pytest.approx(3.0, abs=0.05)

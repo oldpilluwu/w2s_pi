@@ -115,6 +115,39 @@ def _prob_delta_options(config) -> dict:
     return opts
 
 
+_OPD_PI_DEFAULTS = {
+    # weight of the PI log-ratio term added to Direct-OPD's reward (0 = plain Direct-OPD)
+    "alpha": 0.0,
+    # run the PI teacher pass and log opd_pi/* even when alpha = 0 (preflight)
+    "shadow": False,
+    # clip of log T(.|gold) - log T per token (<= 0: no clip)
+    "clip": 2.0,
+    "mask_answer_span": True,
+    "answer_markers": ["Answer:", "\\boxed{"],
+    "pi_gate": "all",
+    "pi_gate_threshold": 0.5,
+}
+
+
+def _opd_pi_options(config, reward_mode: str) -> dict | None:
+    """PI-OPD options; None when the PI teacher pass is not needed."""
+    user = OmegaConf.select(config, "opd_pi", default=None)
+    opts = dict(_OPD_PI_DEFAULTS)
+    if user is not None:
+        opts.update(OmegaConf.to_container(user, resolve=True))
+    unknown = set(opts) - set(_OPD_PI_DEFAULTS)
+    if unknown:
+        raise ValueError(f"Unknown opd_pi options: {sorted(unknown)}")
+    opts["alpha"], opts["clip"] = float(opts["alpha"]), float(opts["clip"])
+    opts["shadow"] = str(opts["shadow"]).lower() in ("true", "1")
+    opts["mask_answer_span"] = str(opts["mask_answer_span"]).lower() in ("true", "1")
+    if opts["alpha"] == 0.0 and not opts["shadow"]:
+        return None
+    if reward_mode != "delta_opd":
+        raise ValueError(f"opd_pi.alpha / opd_pi.shadow need reward_mode=delta_opd, got {reward_mode!r}")
+    return opts
+
+
 def _build_per_prompt_balanced_indices(num_prompts: int, repeat_times: int, dp_size: int) -> list[int] | None:
     """Build rank-major indices so every rollout DP rank gets the same count per prompt."""
     if num_prompts <= 0 or repeat_times <= 0 or dp_size <= 0:
@@ -682,6 +715,7 @@ class RayPPOTrainer:
         self.use_delta_opd_sampled = self.reward_mode == "delta_opd_sampled"
         self.use_prob_delta = self.reward_mode == "prob_delta"
         self.prob_delta_cfg = _prob_delta_options(self.config) if self.use_prob_delta else None
+        self.opd_pi_cfg = _opd_pi_options(self.config, self.reward_mode)
         if self.use_prob_delta and not self.use_reference_policy:
             raise ValueError("reward_mode=prob_delta needs the frozen reference student (RefPolicy role)")
         self.use_teacher_ref_scorer = self.use_delta_opd or self.use_delta_opd_sampled or self.use_prob_delta
@@ -1088,6 +1122,66 @@ class RayPPOTrainer:
         if "teacher_unmappable_response" in t2.batch.keys():
             metrics["prob_delta/teacher_unmappable_response_frac"] = pd.masked_position_mean(
                 t2.batch["teacher_unmappable_response"].float().cpu(), m
+            )
+        return batch
+
+    def _opd_pi_step(self, batch: DataProto, metrics: dict) -> DataProto:
+        """PI-OPD: add alpha * w_PI * pi_hat * clip(log T(.|gold) - log T) to Direct-OPD's top-k reward.
+
+        One extra teacher pass (gold-answer hint in the prompt) on the student's top-k ids; the plain
+        teacher's log-probs on the same ids come from Direct-OPD's own pass."""
+        from verl.trainer.ppo import prob_delta as pd
+
+        cfg = self.opd_pi_cfg
+        strategy = batch.meta_info.get("top_k_strategy", "only_stu")
+        if strategy != "only_stu":
+            raise ValueError(f"opd_pi needs top_k_strategy=only_stu (teacher scored on student top-k), got {strategy!r}")
+        response_mask = batch.batch["response_mask"].cpu()
+        bsz = response_mask.shape[0]
+        student_ids = batch.batch["student_top_k_ids"].long().cpu()
+        student_logp = batch.batch["student_top_k_log_probs"].float().cpu()
+        logp_t = batch.batch["teacher_on_student_log_probs"].float().cpu()
+        logp_r = batch.batch["teacher_ref_on_student_log_probs"].float().cpu()
+
+        tpi = self._prob_delta_teacher_call(self.rm_wg, batch, student_ids, include_answer=True)
+        logp_t_pi = tpi.batch["teacher_on_student_log_probs"].float().cpu()
+
+        pass_rates = None
+        if cfg["pi_gate"] in ("fail", "pass", "soft"):
+            extra = batch.non_tensor_batch.get("extra_info", None)
+            if extra is None:
+                raise KeyError("opd_pi.pi_gate needs non_tensor_batch['extra_info']['teacher_pass_rate']")
+            pass_rates = torch.tensor(
+                [float((e or {}).get("teacher_pass_rate", float("nan"))) for e in extra], dtype=torch.float32
+            )
+        seq_gate = pd.compute_pi_gate(cfg["pi_gate"], pass_rates, cfg["pi_gate_threshold"])
+        if seq_gate is None:
+            seq_gate = torch.full((bsz,), 0.0 if cfg["pi_gate"] == "none" else 1.0)
+        pi_weight = seq_gate.view(-1, 1).expand_as(response_mask).float() * response_mask.float()
+        answer_mask = torch.zeros_like(response_mask, dtype=torch.bool)
+        if cfg["mask_answer_span"]:
+            answer_mask = pd.answer_span_mask(
+                batch.batch["responses"].cpu(), response_mask, self._prob_delta_vocab_pieces(), cfg["answer_markers"]
+            )
+            pi_weight = pi_weight * (~answer_mask).float()
+
+        rm_pi, delta_pi = pd.compute_opd_pi_terms(
+            student_logp, logp_t, logp_t_pi, pi_weight, alpha=cfg["alpha"], clip=cfg["clip"]
+        )
+        if cfg["alpha"] != 0.0:
+            rm = batch.batch["rm_scores"]
+            batch.batch["rm_scores"] = (rm.float().cpu() + rm_pi).to(dtype=rm.dtype, device=rm.device)
+
+        metrics.update(
+            pd.opd_pi_metrics(
+                student_logp, logp_t, logp_r, delta_pi, rm_pi, response_mask, answer_mask, cfg["clip"]
+            )
+        )
+        metrics["opd_pi/alpha"] = cfg["alpha"]
+        metrics["opd_pi/pi_gate_frac_sequences"] = float((seq_gate > 0).float().mean())
+        if "teacher_unmappable_response" in tpi.batch.keys():
+            metrics["opd_pi/teacher_unmappable_response_frac"] = pd.masked_position_mean(
+                tpi.batch["teacher_unmappable_response"].float().cpu(), response_mask.bool()
             )
         return batch
 
@@ -1899,6 +1993,11 @@ class RayPPOTrainer:
                                         response_mask=response_mask,
                                     )
                                 )
+                                # PI-OPD: after the delta_opd/* metrics, so the adaptive KL
+                                # coefficient keeps following the RL-only reward
+                                if self.opd_pi_cfg is not None:
+                                    with marked_timer("opd_pi", timing_raw, color="orange"):
+                                        batch = self._opd_pi_step(batch, metrics)
                                 if "teacher_ref_overlap_mask" in batch.batch.keys():
                                     metrics.update(
                                         _compute_ref_teacher_overlap_metrics(
